@@ -23,20 +23,40 @@ std::vector<std::uint8_t> makeTestSignedDistanceFieldVDB()
   return tesseract::geometry::writeSignedDistanceFieldVDB(*sdf);
 }
 
+/** @brief A sparse field's NanoVDB file: one grid, the band clamp not stored in it. */
+std::vector<std::uint8_t> makeTestSparseSignedDistanceFieldNVDB()
+{
+  const tesseract::geometry::SignedDistanceFunction sphere = [](const Eigen::Vector3d& point) {
+    return point.norm() - 0.5;
+  };
+  const auto fine = tesseract::geometry::createDiscreteSignedDistanceField(
+      sphere, Eigen::Vector3d(-0.75, -0.75, -0.75), Eigen::Vector3d(0.75, 0.75, 0.75), Eigen::Vector3i(7, 7, 7));
+  const tesseract::geometry::SignedDistanceField sparse(
+      { { tesseract::geometry::writeSignedDistanceFieldNVDB(*fine), 0.25 } });
+  return tesseract::geometry::writeSignedDistanceFieldNVDB(sparse);
+}
+
 class VDBResourceLocator final : public tesseract::common::ResourceLocator
 {
 public:
-  explicit VDBResourceLocator(std::vector<std::uint8_t> data) : data_(std::move(data)) {}
+  explicit VDBResourceLocator(std::vector<std::uint8_t> data,
+                              std::vector<std::uint8_t> sparse = makeTestSparseSignedDistanceFieldNVDB())
+    : data_(std::move(data)), sparse_(std::move(sparse))
+  {
+  }
 
   tesseract::common::Resource::Ptr locateResource(const std::string& url) const override
   {
-    if (url != "memory://sphere.vdb")
-      return nullptr;
-    return std::make_shared<tesseract::common::BytesResource>(url, data_);
+    if (url == "memory://sphere.vdb")
+      return std::make_shared<tesseract::common::BytesResource>(url, data_);
+    if (url == "memory://layers.nvdb")
+      return std::make_shared<tesseract::common::BytesResource>(url, sparse_);
+    return nullptr;
   }
 
 private:
   std::vector<std::uint8_t> data_;
+  std::vector<std::uint8_t> sparse_;
 };
 }  // namespace
 
@@ -71,6 +91,47 @@ TEST(TesseractURDFUnit, parse_signed_distance_field)  // NOLINT
     EXPECT_NEAR(geom->getScale()[0], 1, 1e-5);
     EXPECT_NEAR(geom->getScale()[1], 2, 1e-5);
     EXPECT_NEAR(geom->getScale()[2], 3, 1e-5);
+  }
+
+  {  // Band clamps: an .nvdb file's grid read as a sparse field
+    std::string str = R"(<tesseract:signed_distance_field filename="memory://layers.nvdb" band_clamps="0.25"/>)";
+    tesseract::geometry::SignedDistanceField::Ptr geom;
+    EXPECT_TRUE(runTest<tesseract::geometry::SignedDistanceField::Ptr>(
+        geom,
+        &tesseract::urdf::parseSignedDistanceField,
+        str,
+        tesseract::urdf::SIGNED_DISTANCE_FIELD_ELEMENT_NAME.data(),
+        resource_locator));
+    ASSERT_TRUE(geom != nullptr);
+    ASSERT_TRUE(geom->isSparse());
+    ASSERT_EQ(geom->getLayers().size(), 1);
+    EXPECT_DOUBLE_EQ(geom->getLayers()[0].band_clamp, 0.25);
+  }
+
+  {  // Failure: two clamps for a one-grid file
+    std::string str = R"(<tesseract:signed_distance_field filename="memory://layers.nvdb" band_clamps="0.25 0"/>)";
+    tesseract::geometry::SignedDistanceField::Ptr geom;
+    EXPECT_FALSE(runTest<tesseract::geometry::SignedDistanceField::Ptr>(
+        geom,
+        &tesseract::urdf::parseSignedDistanceField,
+        str,
+        tesseract::urdf::SIGNED_DISTANCE_FIELD_ELEMENT_NAME.data(),
+        resource_locator));
+  }
+
+  {  // Failure: band clamps on a .vdb file, and a bad clamp token
+    for (const std::string str :
+         { R"(<tesseract:signed_distance_field filename="memory://sphere.vdb" band_clamps="0.25"/>)",
+           R"(<tesseract:signed_distance_field filename="memory://layers.nvdb" band_clamps="0.25 x"/>)" })
+    {
+      tesseract::geometry::SignedDistanceField::Ptr geom;
+      EXPECT_FALSE(runTest<tesseract::geometry::SignedDistanceField::Ptr>(
+          geom,
+          &tesseract::urdf::parseSignedDistanceField,
+          str,
+          tesseract::urdf::SIGNED_DISTANCE_FIELD_ELEMENT_NAME.data(),
+          resource_locator));
+    }
   }
 
   {  // Failure: missing filename
@@ -159,6 +220,21 @@ TEST(TesseractURDFUnit, write_signed_distance_field)  // NOLINT
                                                                        tesseract::common::getTempPath(),
                                                                        std::string("sdf1.vdb")));
     EXPECT_NE(text.find("scale=\"0.5 0.5 0.5\""), std::string::npos);
+  }
+
+  {  // A sparse field writes its band clamps beside the file
+    const auto fine = make_field(Eigen::Vector3d(1, 1, 1));
+    auto sdf = std::make_shared<tesseract::geometry::SignedDistanceField>(
+        std::vector<tesseract::geometry::SignedDistanceFieldLayer>{
+            { tesseract::geometry::writeSignedDistanceFieldNVDB(*fine), 0.25 } });
+    std::string text;
+    EXPECT_EQ(0,
+              writeTest<tesseract::geometry::SignedDistanceField::Ptr>(sdf,
+                                                                       &tesseract::urdf::writeSignedDistanceField,
+                                                                       text,
+                                                                       tesseract::common::getTempPath(),
+                                                                       std::string("sdf_sparse.nvdb")));
+    EXPECT_NE(text.find("band_clamps=\"0.25\""), std::string::npos) << text;
   }
 
   {  // Failure: unwritable path

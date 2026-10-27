@@ -29,6 +29,7 @@ TESSERACT_COMMON_IGNORE_WARNINGS_PUSH
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <locale>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -94,6 +95,24 @@ parseSignedDistanceField(const tinyxml2::XMLElement* xml_element, const tesserac
     scale = Eigen::Vector3d(sx, sy, sz);
   }
 
+  // A sparse field's band clamp, one per grid of an .nvdb file. Without it the file is read as one
+  // dense grid.
+  std::string clamps_string;
+  std::vector<double> band_clamps;
+  if (tesseract::common::QueryStringAttribute(xml_element, "band_clamps", clamps_string) == tinyxml2::XML_SUCCESS)
+  {
+    std::vector<std::string> tokens;
+    boost::split(tokens, clamps_string, boost::is_any_of(" "), boost::token_compress_on);
+    if (tokens.empty() || !tesseract::common::isNumeric(tokens))
+      std::throw_with_nested(std::runtime_error("SignedDistanceField: Failed parsing attribute 'band_clamps'!"));
+    for (const std::string& token : tokens)
+    {
+      double value{ 0 };
+      tesseract::common::toNumeric<double>(token, value);
+      band_clamps.push_back(value);
+    }
+  }
+
   tesseract::common::Resource::Ptr resource = locator.locateResource(filename);
   if (resource == nullptr)
     std::throw_with_nested(std::runtime_error("SignedDistanceField: Missing resource '" + filename + "'!"));
@@ -105,8 +124,12 @@ parseSignedDistanceField(const tinyxml2::XMLElement* xml_element, const tesserac
   tesseract::geometry::SignedDistanceField::Ptr geom;
   try
   {
+    if (!band_clamps.empty() && !hasExtension(filename, ".nvdb"))
+      throw std::runtime_error("'band_clamps' needs an .nvdb file");
     if (hasExtension(filename, ".vdb"))
       geom = tesseract::geometry::readSignedDistanceFieldVDB(data, scale);
+    else if (hasExtension(filename, ".nvdb") && !band_clamps.empty())
+      geom = tesseract::geometry::readSparseSignedDistanceFieldNVDB(data, band_clamps, scale);
     else if (hasExtension(filename, ".nvdb"))
       geom = tesseract::geometry::readSignedDistanceFieldNVDB(data, scale);
     else
@@ -155,6 +178,16 @@ tinyxml2::XMLElement* writeSignedDistanceField(const tesseract::geometry::Signed
     std::stringstream scale_string;
     scale_string << sdf->getScale().format(eigen_format);
     xml_element->SetAttribute("scale", scale_string.str().c_str());
+  }
+
+  if (sdf->isSparse())
+  {
+    std::stringstream clamps_string;
+    clamps_string.imbue(std::locale::classic());
+    clamps_string.precision(17);
+    for (const auto& layer : sdf->getLayers())
+      clamps_string << (clamps_string.tellp() > 0 ? " " : "") << layer.band_clamp;
+    xml_element->SetAttribute("band_clamps", clamps_string.str().c_str());
   }
 
   return xml_element;

@@ -121,6 +121,23 @@ void serialize(Archive& ar, Octree& obj)
   }
 }
 
+/** @brief The archive format version @ref serialize writes for a SignedDistanceField. */
+constexpr std::uint32_t SIGNED_DISTANCE_FIELD_ARCHIVE_VERSION = 1;
+
+template <class Archive>
+void serialize(Archive& ar, SignedDistanceFieldLayer& obj)
+{
+  ar(cereal::make_nvp("nvdb", obj.nvdb));
+  ar(cereal::make_nvp("band_clamp", obj.band_clamp));
+}
+
+/**
+ * @brief Format version 1, the first with a version: the interpolation settings, then either the
+ * layers (a sparse field, whose domain and dimensions follow from them) or the dense grid, then the
+ * scale. A later format bumps SIGNED_DISTANCE_FIELD_ARCHIVE_VERSION and branches on it here.
+ * @note An explicit field rather than CEREAL_CLASS_VERSION: cereal also matches the base class's
+ * unversioned serialize for this type and rejects the pair as ambiguous.
+ */
 template <class Archive>
 void serialize(Archive& ar, SignedDistanceField& obj)
 {
@@ -128,16 +145,41 @@ void serialize(Archive& ar, SignedDistanceField& obj)
   // is a no-op (no sampler), and the grid is populated by the archive below.
   obj.discretize();
   ar(cereal::base_class<Geometry>(&obj));
-  ar(cereal::make_nvp("domain_min", obj.domain_.min()));
-  ar(cereal::make_nvp("domain_max", obj.domain_.max()));
-  ar(cereal::make_nvp("dim_x", obj.dimensions_.x()));
-  ar(cereal::make_nvp("dim_y", obj.dimensions_.y()));
-  ar(cereal::make_nvp("dim_z", obj.dimensions_.z()));
-  ar(cereal::make_nvp("distances", obj.distances_));
+  std::uint32_t version = SIGNED_DISTANCE_FIELD_ARCHIVE_VERSION;
+  ar(cereal::make_nvp("version", version));
+  if (version != SIGNED_DISTANCE_FIELD_ARCHIVE_VERSION)
+    throw std::runtime_error("SignedDistanceField: unsupported archive version " + std::to_string(version));
+  auto interpolation = static_cast<std::uint8_t>(obj.interpolation_);
+  auto gradient_interpolation = static_cast<std::uint8_t>(obj.gradient_interpolation_);
+  ar(cereal::make_nvp("interpolation", interpolation));
+  ar(cereal::make_nvp("gradient_interpolation", gradient_interpolation));
+  if (Archive::is_loading::value)
+  {
+    for (std::uint8_t method : { interpolation, gradient_interpolation })
+      if (method > static_cast<std::uint8_t>(SignedDistanceFieldInterpolation::TRICUBIC))
+        throw std::runtime_error("SignedDistanceField: unknown interpolation " + std::to_string(method));
+    obj.interpolation_ = static_cast<SignedDistanceFieldInterpolation>(interpolation);
+    obj.gradient_interpolation_ = static_cast<SignedDistanceFieldInterpolation>(gradient_interpolation);
+  }
+  std::vector<SignedDistanceFieldLayer> layers = obj.getLayers();
+  ar(cereal::make_nvp("layers", layers));
+  if (layers.empty())
+  {
+    ar(cereal::make_nvp("domain_min", obj.domain_.min()));
+    ar(cereal::make_nvp("domain_max", obj.domain_.max()));
+    ar(cereal::make_nvp("dim_x", obj.dimensions_.x()));
+    ar(cereal::make_nvp("dim_y", obj.dimensions_.y()));
+    ar(cereal::make_nvp("dim_z", obj.dimensions_.z()));
+    ar(cereal::make_nvp("distances", obj.distances_));
+  }
   ar(cereal::make_nvp("scale", obj.scale_));
 
   if (Archive::is_loading::value)
+  {
+    if (!layers.empty())
+      obj.initializeSparse(std::move(layers));
     obj.validate();
+  }
 }
 
 template <class Archive>
