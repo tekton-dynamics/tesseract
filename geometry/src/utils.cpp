@@ -213,10 +213,11 @@ bool isIdentical(const Geometry& geom1, const Geometry& geom2)
       const auto& s2 = static_cast<const SignedDistanceField&>(geom2);
 
       if (s1.getInterpolation() != s2.getInterpolation() ||
-          s1.getGradientInterpolation() != s2.getGradientInterpolation())
+          s1.getGradientInterpolation() != s2.getGradientInterpolation() ||
+          s1.getLayerBlendWidth() != s2.getLayerBlendWidth())
         return false;
 
-      // A sparse field has no dense grid to compare; it is identical when its layer is.
+      // A sparse field has no dense grid to compare; it is identical when its layers are.
       if (s1.isSparse() || s2.isSparse())
       {
         if (s1.isSparse() != s2.isSparse() || s1.getLayers() != s2.getLayers())

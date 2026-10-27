@@ -231,6 +231,7 @@ TEST(TesseractGeometrySerializeUnit, SignedDistanceFieldInterpolationSettings)  
   SignedDistanceField object(domain, Eigen::Vector3i::Constant(5), distances);
   object.setInterpolation(tesseract::geometry::SignedDistanceFieldInterpolation::TRILINEAR);
   object.setGradientInterpolation(tesseract::geometry::SignedDistanceFieldInterpolation::TRICUBIC);
+  object.setLayerBlendWidth(0.25);
 
   std::stringstream ss;
   {
@@ -242,6 +243,7 @@ TEST(TesseractGeometrySerializeUnit, SignedDistanceFieldInterpolationSettings)  
   ar(loaded);
   EXPECT_EQ(loaded.getInterpolation(), tesseract::geometry::SignedDistanceFieldInterpolation::TRILINEAR);
   EXPECT_EQ(loaded.getGradientInterpolation(), tesseract::geometry::SignedDistanceFieldInterpolation::TRICUBIC);
+  EXPECT_EQ(loaded.getLayerBlendWidth(), 0.25);
   const Eigen::Vector3d p(0.31, 0.12, -0.27);
   EXPECT_EQ(loaded.getGradient(p), object.getGradient(p));
   EXPECT_EQ(loaded, object);
@@ -252,18 +254,37 @@ TEST(TesseractGeometrySerializeUnit, SignedDistanceFieldInterpolationSettings)  
     cereal::XMLOutputArchive out(xml);
     out(object);
   }
-  std::string text = xml.str();
-  const auto at = text.find("<version>1</version>");
+  const std::string text = xml.str();
+  const auto at = text.find("<version>2</version>");
   ASSERT_NE(at, std::string::npos);
-  text.replace(at, 20, "<version>2</version>");
-  std::stringstream newer(text);
+  std::string newer_text = text;
+  newer_text.replace(at, 20, "<version>3</version>");
+  std::stringstream newer(newer_text);
   cereal::XMLInputArchive in(newer);
   SignedDistanceField rejected;
   EXPECT_ANY_THROW(in(rejected));  // NOLINT
+
+  // A version 1 archive has no blend width and still loads, with a width of 0.
+  std::string v1_text = text;
+  v1_text.replace(at, 20, "<version>1</version>");
+  const auto width_begin = v1_text.find("<layer_blend_width>");
+  const std::string width_close = "</layer_blend_width>";
+  const auto width_end = v1_text.find(width_close);
+  ASSERT_NE(width_begin, std::string::npos);
+  ASSERT_NE(width_end, std::string::npos);
+  v1_text.erase(width_begin, width_end + width_close.size() - width_begin);
+  std::stringstream v1(v1_text);
+  cereal::XMLInputArchive v1_in(v1);
+  SignedDistanceField v1_loaded;
+  v1_in(v1_loaded);
+  EXPECT_EQ(v1_loaded.getLayerBlendWidth(), 0.0);
+  EXPECT_EQ(v1_loaded.getGradientInterpolation(), tesseract::geometry::SignedDistanceFieldInterpolation::TRICUBIC);
+  EXPECT_EQ(v1_loaded.getDistance(p), object.getDistance(p));
 }
 TEST(TesseractGeometrySerializeUnit, SignedDistanceFieldSparse)  // NOLINT
 {
-  // One layer made from a dense field's NanoVDB file.
+  // Two layers made from dense fields' NanoVDB files: a fine one over a small box and a coarse one
+  // over a larger box.
   const auto grid = [](double half, int n) {
     std::vector<double> distances;
     const double step = 2.0 * half / (n - 1);
@@ -275,9 +296,10 @@ TEST(TesseractGeometrySerializeUnit, SignedDistanceFieldSparse)  // NOLINT
                                Eigen::Vector3i::Constant(n),
                                distances);
   };
-  std::vector<SignedDistanceFieldLayer> layers(1);
+  std::vector<SignedDistanceFieldLayer> layers(2);
   layers[0].nvdb = writeSignedDistanceFieldNVDB(grid(0.5, 21));
   layers[0].band_clamp = 0.25;
+  layers[1].nvdb = writeSignedDistanceFieldNVDB(grid(1.0, 11));
   auto object = std::make_shared<SignedDistanceField>(layers, Eigen::Vector3d::Constant(1e-3));
   ASSERT_TRUE(object->isSparse());
   tesseract::common::testSerialization<SignedDistanceField>(*object, "SignedDistanceFieldSparse");

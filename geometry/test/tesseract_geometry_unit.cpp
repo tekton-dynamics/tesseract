@@ -1241,6 +1241,81 @@ TEST(TesseractGeometryUnit, SignedDistanceFieldSparseActivity)  // NOLINT
   EXPECT_NEAR(signed_field.getDistance(on_band), SPHERE(on_band), 5e-3);
 }
 
+TEST(TesseractGeometryUnit, SignedDistanceFieldSparseLayers)  // NOLINT
+{
+  using tesseract::geometry::SignedDistanceField;
+  using tesseract::geometry::SignedDistanceFieldLayer;
+  // Fine layer: 0.025 voxels near the surface, values clamped at 0.05 (a narrow band), active a
+  // little past the clamp so saturated values are present and must be passed over.
+  const double fine_voxel = 0.025;
+  const double clamp = 0.05;
+  SignedDistanceFieldLayer fine;
+  fine.band_clamp = clamp;
+  fine.nvdb = makeNanoVDBGrid([clamp](const Eigen::Vector3d& p) { return std::clamp(SPHERE(p), -clamp, clamp); },
+                              Eigen::Vector3d::Zero(),
+                              fine_voxel,
+                              Eigen::Vector3i::Constant(-20),
+                              Eigen::Vector3i::Constant(20),
+                              [](const Eigen::Vector3d& p) { return std::abs(SPHERE(p)) <= 0.1; });
+  // Coarse layer: 0.1 voxels everywhere over a larger box, true distances.
+  SignedDistanceFieldLayer coarse;
+  coarse.nvdb = makeNanoVDBGrid(
+      SPHERE, Eigen::Vector3d::Zero(), 0.1, Eigen::Vector3i::Constant(-10), Eigen::Vector3i::Constant(10));
+  const SignedDistanceField field({ fine, coarse });
+  const SignedDistanceField fine_only({ fine });
+  const SignedDistanceField coarse_only({ coarse });
+
+  // Domain is the union; nominal dimensions follow the finest spacing.
+  EXPECT_TRUE(field.getDomain().min().isApprox(Eigen::Vector3d::Constant(-1.0), 1e-12));
+  EXPECT_TRUE(field.getDomain().max().isApprox(Eigen::Vector3d::Constant(1.0), 1e-12));
+  EXPECT_EQ(field.getDimensions(), Eigen::Vector3i::Constant(81));
+
+  // Near the surface the fine layer answers.
+  const Eigen::Vector3d near_surface(0.31, 0.012, 0.007);
+  EXPECT_DOUBLE_EQ(field.getDistance(near_surface), fine_only.getDistance(near_surface));
+  EXPECT_TRUE(field.getGradient(near_surface).isApprox(fine_only.getGradient(near_surface)));
+  // Inside the fine layer's active region but past its clamp: the coarse layer answers.
+  const Eigen::Vector3d saturated(0.385, 0.012, 0.007);
+  ASSERT_GE(std::abs(fine_only.getDistance(saturated)), clamp * (1 - 1e-4));
+  EXPECT_DOUBLE_EQ(field.getDistance(saturated), coarse_only.getDistance(saturated));
+  // Far from the surface only the coarse layer has data.
+  const Eigen::Vector3d far(0.81, -0.62, 0.33);
+  EXPECT_DOUBLE_EQ(field.getDistance(far), coarse_only.getDistance(far));
+  EXPECT_NEAR(field.getDistance(far), SPHERE(far), 0.02);
+  // Outside every layer: the last layer's clamp, here 0, so +infinity.
+  EXPECT_EQ(field.getDistance(Eigen::Vector3d(1.5, 0, 0)), std::numeric_limits<double>::infinity());
+
+  // Order matters: coarse first would answer everywhere it has data, so it is refused.
+  EXPECT_ANY_THROW(SignedDistanceField({ coarse, fine }));  // NOLINT
+
+  // Walking out through the clamp handover, the distance steps by the layers' disagreement; with a
+  // blend width it stays continuous, and its gradient is the blend's own.
+  const auto largest_step = [](const SignedDistanceField& f) {
+    double largest = 0;
+    const double h = 1e-5;
+    for (double x = 0.33; x < 0.37; x += h)
+      largest = std::max(largest,
+                         std::abs(f.getDistance(Eigen::Vector3d(x + h, 0.012, 0.007)) -
+                                  f.getDistance(Eigen::Vector3d(x, 0.012, 0.007))));
+    return largest;
+  };
+  EXPECT_GT(largest_step(field), 1e-4);
+  SignedDistanceField blended = field;
+  blended.setLayerBlendWidth(0.02);
+  EXPECT_EQ(blended.getLayerBlendWidth(), 0.02);
+  EXPECT_LT(largest_step(blended), 3e-5);
+  EXPECT_FALSE(tesseract::geometry::isIdentical(blended, field));
+  // Below the blend zone the fine layer answers alone; past the clamp the coarse layer does.
+  EXPECT_DOUBLE_EQ(blended.getDistance(near_surface), field.getDistance(near_surface));
+  EXPECT_DOUBLE_EQ(blended.getDistance(saturated), field.getDistance(saturated));
+  const Eigen::Vector3d in_zone(0.34, 0.012, 0.007);
+  ASSERT_GT(std::abs(fine_only.getDistance(in_zone)), clamp - 0.02);
+  ASSERT_LT(std::abs(fine_only.getDistance(in_zone)), clamp);
+  EXPECT_NE(blended.getDistance(in_zone), field.getDistance(in_zone));
+  EXPECT_TRUE(blended.getGradient(in_zone).isApprox(finiteDifferenceGradient(blended, in_zone, 1e-7), 1e-4));
+  EXPECT_ANY_THROW(blended.setLayerBlendWidth(-1.0));  // NOLINT
+}
+
 TEST(TesseractGeometryUnit, SignedDistanceFieldSparseEncoding)  // NOLINT
 {
   using tesseract::geometry::SignedDistanceField;
@@ -1253,25 +1328,30 @@ TEST(TesseractGeometryUnit, SignedDistanceFieldSparseEncoding)  // NOLINT
                               Eigen::Vector3i::Constant(-20),
                               Eigen::Vector3i::Constant(20),
                               [](const Eigen::Vector3d& p) { return std::abs(SPHERE(p)) <= 0.1; });
-  const SignedDistanceField field({ fine }, Eigen::Vector3d::Constant(1e-3));
+  SignedDistanceFieldLayer coarse;
+  coarse.band_clamp = 0.7;
+  coarse.nvdb = makeNanoVDBGrid(
+      SPHERE, Eigen::Vector3d::Zero(), 0.1, Eigen::Vector3i::Constant(-10), Eigen::Vector3i::Constant(10));
+  const SignedDistanceField field({ fine, coarse }, Eigen::Vector3d::Constant(1e-3));
 
   // Layers are stored canonically: re-encoding a stored layer is a no-op.
   const SignedDistanceField again(field.getLayers(), field.getScale());
   EXPECT_EQ(again.getLayers(), field.getLayers());
   EXPECT_TRUE(tesseract::geometry::isIdentical(again, field));
 
-  // NanoVDB round trip: the grid, read back with its clamp as the same sparse field.
+  // NanoVDB round trip: one grid per layer, read back with the clamps as the same sparse field.
   const std::vector<std::uint8_t> nvdb = tesseract::geometry::writeSignedDistanceFieldNVDB(field);
-  auto read = tesseract::geometry::readSparseSignedDistanceFieldNVDB(nvdb, { 0.05 }, field.getScale());
+  auto read = tesseract::geometry::readSparseSignedDistanceFieldNVDB(nvdb, { 0.05, 0.7 }, field.getScale());
   ASSERT_TRUE(read->isSparse());
   EXPECT_EQ(read->getLayers(), field.getLayers());
   EXPECT_TRUE(tesseract::geometry::isIdentical(*read, field));
   EXPECT_EQ(tesseract::geometry::writeSignedDistanceFieldNVDB(*read), nvdb);
   for (const Eigen::Vector3d& p : probePoints(0.95, 0.025, 50))
     EXPECT_EQ(read->getDistance(p), field.getDistance(p)) << p.transpose();
-  EXPECT_DOUBLE_EQ(read->getDistance(Eigen::Vector3d(5, 5, 5)), 0.05);
-  // The clamp travels beside the file, one per grid.
-  EXPECT_ANY_THROW(tesseract::geometry::readSparseSignedDistanceFieldNVDB(nvdb, { 0.05, 0.7 }));  // NOLINT
+  EXPECT_DOUBLE_EQ(read->getDistance(Eigen::Vector3d(5, 5, 5)), 0.7);
+  // The clamps travel beside the file, one per grid; the dense reader refuses several grids.
+  EXPECT_ANY_THROW(tesseract::geometry::readSparseSignedDistanceFieldNVDB(nvdb, { 0.05 }));  // NOLINT
+  EXPECT_ANY_THROW(tesseract::geometry::readSignedDistanceFieldNVDB(nvdb));                  // NOLINT
 
   // A single grid reads back dense, whatever it is named.
   auto dense = makeGridField(SPHERE, 0.5, 11);
@@ -1302,13 +1382,18 @@ TEST(TesseractGeometryUnit, SignedDistanceFieldSparseRejectsInvalidLayers)  // N
       SPHERE, Eigen::Vector3d::Zero(), 0.1, Eigen::Vector3i::Constant(-3), Eigen::Vector3i::Constant(3));
   EXPECT_ANY_THROW(SignedDistanceField(std::vector<SignedDistanceFieldLayer>{}));                 // NOLINT
   EXPECT_ANY_THROW(SignedDistanceField({ SignedDistanceFieldLayer{} }));                          // NOLINT
-  EXPECT_ANY_THROW(SignedDistanceField({ { grid, 0.0 }, { grid, 0.0 } }));                        // NOLINT
   EXPECT_ANY_THROW(SignedDistanceField({ { grid, -1.0 } }));                                      // NOLINT
   EXPECT_ANY_THROW(SignedDistanceField({ { grid, std::numeric_limits<double>::quiet_NaN() } }));  // NOLINT
   EXPECT_ANY_THROW(SignedDistanceField({ { std::vector<std::uint8_t>(64, 7), 0.0 } }));           // NOLINT
   std::vector<std::uint8_t> truncated(grid.begin(), grid.begin() + static_cast<std::ptrdiff_t>(grid.size() / 2));
   EXPECT_ANY_THROW(SignedDistanceField({ { truncated, 0.0 } }));  // NOLINT
   EXPECT_NO_THROW(SignedDistanceField({ { grid, 0.0 } }));        // NOLINT
+
+  // Layers go finest first.
+  const std::vector<std::uint8_t> finer = makeNanoVDBGrid(
+      SPHERE, Eigen::Vector3d::Zero(), 0.05, Eigen::Vector3i::Constant(-6), Eigen::Vector3i::Constant(6));
+  EXPECT_NO_THROW(SignedDistanceField({ { finer, 0.1 }, { grid, 0.0 } }));   // NOLINT
+  EXPECT_ANY_THROW(SignedDistanceField({ { grid, 0.1 }, { finer, 0.0 } }));  // NOLINT
 
   // The grid's own header: the last "NanoVDB" magic in the file starts the grid (the first is the
   // file's). A fog volume (class 2 at offset 632) and an unknown major version (offset 16) are refused.

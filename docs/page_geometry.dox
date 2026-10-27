@@ -35,7 +35,7 @@ Analytically-defined shapes with exact representations:
 
 A volumetric, implicit geometry: the signed distance to a surface (negative inside). It is stored in
 a backend-neutral form, either sampled on a regular axis-aligned grid over a local-frame domain, or
-sparse: a NanoVDB grid that holds only the voxels near the surface. Collision
+sparse: one or more NanoVDB grids, finest first, that hold only the voxels near the surface. Collision
 backends query the field in place through its distance and gradient; nothing is copied into a
 backend-specific representation. It enables true concave volumetric contact and
 signed-distance/gradient queries, and is the canonical way to use a distance field. Create one

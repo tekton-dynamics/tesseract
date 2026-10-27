@@ -125,8 +125,9 @@ SignedDistanceField::Ptr readSignedDistanceFieldVDB(const std::vector<std::uint8
 /**
  * @brief Serialize a field as a standard NanoVDB FloatGrid file.
  * @details The field's local @c scale is not stored and must be supplied separately when loading.
- * A sparse field is written as its FloatGrid, as stored. Its band clamp is not stored either: pass
- * it to @ref readSparseSignedDistanceFieldNVDB to read the file back as an equal sparse field.
+ * A sparse field is written as one FloatGrid per layer, finest first, each grid as stored. Its band
+ * clamps are not stored either: pass them to @ref readSparseSignedDistanceFieldNVDB to read the
+ * file back as an equal sparse field.
  * @throws std::runtime_error if the field cannot be represented as a uniform FloatGrid.
  */
 std::vector<std::uint8_t> writeSignedDistanceFieldNVDB(const SignedDistanceField& sdf);
@@ -154,14 +155,14 @@ SignedDistanceField::Ptr readSignedDistanceFieldNVDB(const std::vector<std::uint
                                                      const Eigen::Vector3d& scale = Eigen::Vector3d(1, 1, 1));
 
 /**
- * @brief Read a NanoVDB file holding one FloatGrid as a sparse @ref SignedDistanceField, kept in its
- * stored sparse form.
+ * @brief Read a NanoVDB file as a sparse @ref SignedDistanceField, one layer per grid in file order
+ * (finest first), kept in its stored sparse form.
  * @param data Pointer to the serialized NanoVDB file
  * @param size Number of bytes in @p data
- * @param band_clamps The grid's band clamp (see @ref SignedDistanceFieldLayer), as one value
+ * @param band_clamps Each layer's band clamp (see @ref SignedDistanceFieldLayer), one per grid
  * @param scale Local scaling applied to the field
- * @throw std::runtime_error if the file is malformed, does not hold exactly one grid, the grid is not
- * a valid layer, or the number of clamps differs from the number of grids
+ * @throw std::runtime_error if the file is malformed, a grid is not a valid layer, or the number of
+ * clamps differs from the number of grids
  */
 SignedDistanceField::Ptr readSparseSignedDistanceFieldNVDB(const std::uint8_t* data,
                                                            std::size_t size,
