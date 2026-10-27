@@ -49,13 +49,24 @@ CollisionShapePtr makeSphereSDF()
       sphere, Eigen::Vector3d(-1, -1, -1), Eigen::Vector3d(1, 1, 1), Eigen::Vector3i(16, 16, 16));
 }
 
-/** @brief The sphere of makeSphereSDF sampled with @p cells per axis. */
-CollisionShapePtr gridSphereSDF(int cells)
+/**
+ * @brief The sphere of makeSphereSDF as a sparse field (one NanoVDB layer, read in place), sampled
+ * with @p cells per axis. Unlike the sampler-backed field above, it really is interpolated
+ * (trilinearly), so its accuracy follows its spacing.
+ */
+CollisionShapePtr sparseSphereSDF(int cells)
 {
   const tesseract::geometry::SignedDistanceFunction sphere = [](const Eigen::Vector3d& p) { return p.norm() - 0.5; };
-  return tesseract::geometry::createDiscreteSignedDistanceField(
+  const auto dense = tesseract::geometry::createDiscreteSignedDistanceField(
       sphere, Eigen::Vector3d(-1, -1, -1), Eigen::Vector3d(1, 1, 1), Eigen::Vector3i::Constant(cells));
+  tesseract::geometry::SignedDistanceFieldLayer layer;
+  layer.nvdb = tesseract::geometry::writeSignedDistanceFieldNVDB(*dense);
+  return std::make_shared<tesseract::geometry::SignedDistanceField>(
+      std::vector<tesseract::geometry::SignedDistanceFieldLayer>{ layer });
 }
+
+/** @brief sparseSphereSDF at makeSphereSDF's resolution (16 samples per axis). */
+CollisionShapePtr makeSparseSphereSDF() { return sparseSphereSDF(16); }
 
 using SDFFactory = std::function<CollisionShapePtr()>;
 
@@ -222,12 +233,20 @@ void runSDFPairTest(DiscreteContactManager& checker,
  * @brief A field stored at half size and scaled by 2: f(p) = ||p|| - 0.25 over [-0.5, 0.5]^3, so the
  * world surface is a sphere of radius 0.5. Contacts must come out in scaled (world) units.
  */
-void runScaledSDFTest(DiscreteContactManager& checker)
+void runScaledSDFTest(DiscreteContactManager& checker, bool sparse)
 {
   const tesseract::geometry::SignedDistanceFunction sphere = [](const Eigen::Vector3d& p) { return p.norm() - 0.25; };
   const Eigen::Vector3d scale = Eigen::Vector3d::Constant(2.0);
-  CollisionShapePtr field = tesseract::geometry::createDiscreteSignedDistanceField(
+  auto dense = tesseract::geometry::createDiscreteSignedDistanceField(
       sphere, Eigen::Vector3d::Constant(-0.5), Eigen::Vector3d::Constant(0.5), Eigen::Vector3i::Constant(16), scale);
+  CollisionShapePtr field = dense;
+  if (sparse)
+  {
+    tesseract::geometry::SignedDistanceFieldLayer layer;
+    layer.nvdb = tesseract::geometry::writeSignedDistanceFieldNVDB(*dense);
+    field = std::make_shared<tesseract::geometry::SignedDistanceField>(
+        std::vector<tesseract::geometry::SignedDistanceFieldLayer>{ layer }, scale);
+  }
   addObjects(checker, [&field] { return field; });
   checker.setDefaultCollisionMargin(0.05);
 
@@ -645,16 +664,86 @@ TEST(TesseractCollisionSignedDistanceFieldUnit, FCLDiscreteBVHCone)  // NOLINT
   runSDFCurvedPrimitiveTest(checker, std::make_shared<tesseract::geometry::Cone>(0.1, 0.2), "cone_link");
 }
 
+TEST(TesseractCollisionSignedDistanceFieldUnit, BulletDiscreteSimpleSparse)  // NOLINT
+{
+  BulletDiscreteSimpleManager checker;
+  runSDFTest(checker, makeSparseSphereSDF);
+}
+
+TEST(TesseractCollisionSignedDistanceFieldUnit, BulletDiscreteBVHSparse)  // NOLINT
+{
+  BulletDiscreteBVHManager checker;
+  runSDFTest(checker, makeSparseSphereSDF);
+}
+
+TEST(TesseractCollisionSignedDistanceFieldUnit, FCLDiscreteBVHSparse)  // NOLINT
+{
+  FCLDiscreteBVHManager checker;
+  runSDFTest(checker, makeSparseSphereSDF);
+}
+
+TEST(TesseractCollisionSignedDistanceFieldUnit, BulletDiscreteBVHSparsePositiveDistance)  // NOLINT
+{
+  BulletDiscreteBVHManager checker;
+  runSDFPositiveDistanceTest(checker, makeSparseSphereSDF);
+}
+
+TEST(TesseractCollisionSignedDistanceFieldUnit, FCLDiscreteBVHSparsePositiveDistance)  // NOLINT
+{
+  FCLDiscreteBVHManager checker;
+  runSDFPositiveDistanceTest(checker, makeSparseSphereSDF);
+}
+
+TEST(TesseractCollisionSignedDistanceFieldUnit, BulletDiscreteBVHSparsePair)  // NOLINT
+{
+  // Two trilinear fields: at 16 samples per axis (0.13 spacing) the deepest-point estimate is off
+  // by about 0.02, so the pair uses 32.
+  BulletDiscreteBVHManager checker;
+  const auto make_sdf = [] { return sparseSphereSDF(32); };
+  runSDFPairTest(checker, make_sdf, make_sdf);
+}
+
+TEST(TesseractCollisionSignedDistanceFieldUnit, FCLDiscreteBVHSparseSparsePair)  // NOLINT
+{
+  FCLDiscreteBVHManager checker;
+  const auto make_sdf = [] { return sparseSphereSDF(32); };
+  runSDFPairTest(checker, make_sdf, make_sdf);
+}
+
+TEST(TesseractCollisionSignedDistanceFieldUnit, BulletDiscreteBVHSparseDensePair)  // NOLINT
+{
+  BulletDiscreteBVHManager checker;
+  runSDFPairTest(checker, makeSparseSphereSDF, makeSphereSDF);
+}
+
+TEST(TesseractCollisionSignedDistanceFieldUnit, FCLDiscreteBVHSparsePair)  // NOLINT
+{
+  FCLDiscreteBVHManager checker;
+  runSDFPairTest(checker, makeSparseSphereSDF, makeSphereSDF);
+}
+
 TEST(TesseractCollisionSignedDistanceFieldUnit, BulletDiscreteBVHScaled)  // NOLINT
 {
   BulletDiscreteBVHManager checker;
-  runScaledSDFTest(checker);
+  runScaledSDFTest(checker, false);
+}
+
+TEST(TesseractCollisionSignedDistanceFieldUnit, BulletDiscreteBVHScaledSparse)  // NOLINT
+{
+  BulletDiscreteBVHManager checker;
+  runScaledSDFTest(checker, true);
 }
 
 TEST(TesseractCollisionSignedDistanceFieldUnit, FCLDiscreteBVHScaled)  // NOLINT
 {
   FCLDiscreteBVHManager checker;
-  runScaledSDFTest(checker);
+  runScaledSDFTest(checker, false);
+}
+
+TEST(TesseractCollisionSignedDistanceFieldUnit, FCLDiscreteBVHScaledSparse)  // NOLINT
+{
+  FCLDiscreteBVHManager checker;
+  runScaledSDFTest(checker, true);
 }
 
 TEST(TesseractCollisionSignedDistanceFieldUnit, ContactQueryReadsNormalOnlyWithinThreshold)  // NOLINT
@@ -662,7 +751,9 @@ TEST(TesseractCollisionSignedDistanceFieldUnit, ContactQueryReadsNormalOnlyWithi
   using tesseract::collision::bullet_internal::createShapePrimitive;
   using tesseract::collision::bullet_internal::querySdfShapeContact;
   using tesseract::collision::bullet_internal::querySdfShapePoint;
-  auto geom = std::static_pointer_cast<const tesseract::geometry::SignedDistanceField>(makeSphereSDF());
+  auto field = std::static_pointer_cast<const tesseract::geometry::SignedDistanceField>(makeSparseSphereSDF());
+  auto dense = std::static_pointer_cast<const tesseract::geometry::SignedDistanceField>(makeSphereSDF());
+  for (const auto& geom : { field, dense })
   {
     auto shape = createShapePrimitive(geom);
     ASSERT_NE(shape, nullptr);
@@ -687,8 +778,11 @@ TEST(TesseractCollisionSignedDistanceFieldUnit, BulletConvexHullVertexPath)  // 
 {
   // A convex mesh goes through the per-vertex path (no implicit adapter for arbitrary hulls). Its
   // nearest vertex sets the contact, with the normal read only for vertices within the margin.
+  for (const bool split : { false, true })
   {
-    auto field = gridSphereSDF(32);
+    auto field = std::static_pointer_cast<tesseract::geometry::SignedDistanceField>(sparseSphereSDF(32));
+    if (split)
+      field->setGradientInterpolation(tesseract::geometry::SignedDistanceFieldInterpolation::TRICUBIC);
 
     auto vertices = std::make_shared<tesseract::common::VectorVector3d>();
     for (double x : { -0.05, 0.05 })
@@ -732,7 +826,7 @@ TEST(TesseractCollisionSignedDistanceFieldUnit, BulletConvexHullVertexPath)  // 
     checker.contactTest(result, ContactRequest(ContactTestType::CLOSEST));
     ContactResultVector result_vector;
     result.flattenMoveResults(result_vector);
-    ASSERT_FALSE(result_vector.empty());
+    ASSERT_FALSE(result_vector.empty()) << (split ? "split" : "trilinear");
     EXPECT_NEAR(result_vector[0].distance, std::sqrt((0.53 * 0.53) + (2 * 0.05 * 0.05)) - 0.5, 0.005);
     EXPECT_NEAR(std::abs(result_vector[0].normal.x()), 1.0, 0.05);
 
@@ -793,9 +887,9 @@ TEST(TesseractCollisionSignedDistanceFieldUnit, CreateShapePrimitiveBranches)  /
     EXPECT_ANY_THROW(createShapePrimitive(geom));  // NOLINT
   }
 
-  // The shape queries the field itself.
+  // Sparse field -> queried in place.
   {
-    auto geom = std::static_pointer_cast<const tesseract::geometry::SignedDistanceField>(makeSphereSDF());
+    auto geom = std::static_pointer_cast<const tesseract::geometry::SignedDistanceField>(makeSparseSphereSDF());
     auto shape = createShapePrimitive(geom);
     ASSERT_NE(shape, nullptr);
     auto* field_shape =

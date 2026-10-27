@@ -1,11 +1,21 @@
 #include <tesseract/common/macros.h>
 TESSERACT_COMMON_IGNORE_WARNINGS_PUSH
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdlib>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <numeric>
-#include <vector>
+#include <optional>
+
+extern "C" {
+#include <tinyvdb_io.h>
+#include <tinyvdb_nanovdb.h>
+#include <tinyvdb_sparse_tree.h>
+}
 TESSERACT_COMMON_IGNORE_WARNINGS_POP
 
 #include <tesseract/geometry/geometries.h>
@@ -992,6 +1002,69 @@ TEST(TesseractGeometryUnit, SignedDistanceFieldLazy)  // NOLINT
 
 namespace
 {
+/**
+ * @brief A bare NanoVDB grid buffer holding @p f at origin + voxel * (i, j, k) for each index in
+ * [@p lo, @p hi] whose position passes @p active (all of them when null). Other voxels are inactive.
+ */
+std::vector<std::uint8_t> makeNanoVDBGrid(const tesseract::geometry::SignedDistanceFunction& f,
+                                          const Eigen::Vector3d& origin,
+                                          double voxel,
+                                          const Eigen::Vector3i& lo,
+                                          const Eigen::Vector3i& hi,
+                                          const std::function<bool(const Eigen::Vector3d&)>& active = nullptr,
+                                          float background = 0.0F)
+{
+  std::vector<tvdb_vec3i> coordinates;
+  std::vector<float> values;
+  for (int k = lo.z(); k <= hi.z(); ++k)
+    for (int j = lo.y(); j <= hi.y(); ++j)
+      for (int i = lo.x(); i <= hi.x(); ++i)
+      {
+        const Eigen::Vector3d p = origin + (voxel * Eigen::Vector3d(i, j, k));
+        if (active && !active(p))
+          continue;
+        coordinates.push_back({ i, j, k });
+        values.push_back(static_cast<float>(f(p)));
+      }
+
+  std::string grid_type = "Tree_float_5_4_3";
+  tvdb_grid_t template_grid{};
+  template_grid.descriptor.grid_type = grid_type.data();
+  template_grid.tree.layout.num_levels = 4;
+  template_grid.tree.layout.levels[0] = { TVDB_NODE_ROOT, TVDB_VALUE_FLOAT, 0 };
+  template_grid.tree.layout.levels[1] = { TVDB_NODE_INTERNAL, TVDB_VALUE_FLOAT, 5 };
+  template_grid.tree.layout.levels[2] = { TVDB_NODE_INTERNAL, TVDB_VALUE_FLOAT, 4 };
+  template_grid.tree.layout.levels[3] = { TVDB_NODE_LEAF, TVDB_VALUE_FLOAT, 3 };
+  template_grid.transform.type = TVDB_TRANSFORM_UNIFORM_SCALE_TRANSLATE;
+  for (int axis = 0; axis < 3; ++axis)
+  {
+    template_grid.transform.scale_values[axis] = voxel;
+    template_grid.transform.voxel_size[axis] = voxel;
+    template_grid.transform.translation[axis] = origin[axis];
+  }
+
+  tvdb_grid_t grid{};
+  if (!tvdb_grid_from_sparse_typed_using_template(&template_grid,
+                                                  coordinates.data(),
+                                                  values.data(),
+                                                  values.size(),
+                                                  TVDB_VALUE_FLOAT,
+                                                  &background,
+                                                  "test",
+                                                  &grid))
+    throw std::runtime_error("makeNanoVDBGrid: failed to build the grid");
+  std::uint8_t* data = nullptr;
+  std::size_t size = 0;
+  tvdb_error_t error{};
+  const tvdb_status_t status = tvdb_grid_to_nanovdb_float(&grid, &data, &size, &error);
+  tvdb_grid_destroy_owned(&grid);
+  if (status != TVDB_OK)
+    throw std::runtime_error("makeNanoVDBGrid: failed to convert the grid");
+  std::vector<std::uint8_t> result(data, data + size);
+  std::free(data);  // NOLINT(cppcoreguidelines-no-malloc)
+  return result;
+}
+
 const tesseract::geometry::SignedDistanceFunction SPHERE = [](const Eigen::Vector3d& p) { return p.norm() - 0.3; };
 
 /**
@@ -1067,6 +1140,324 @@ TEST(TesseractGeometryUnit, SignedDistanceFieldGradient)  // NOLINT
       SPHERE, Eigen::Vector3d::Constant(-0.5), Eigen::Vector3d::Constant(0.5), Eigen::Vector3i::Constant(21));
   const Eigen::Vector3d p(0.2, -0.1, 0.15);
   EXPECT_TRUE(lazy->getGradient(p).isApprox(p.normalized(), 1e-6));
+}
+
+TEST(TesseractGeometryUnit, SignedDistanceFieldSparseMatchesDense)  // NOLINT
+{
+  using tesseract::geometry::SignedDistanceField;
+  using tesseract::geometry::SignedDistanceFieldLayer;
+  const double voxel = 0.05;
+  // Index -10..10 at 0.05 from the origin: the same lattice as the dense field below.
+  SignedDistanceFieldLayer layer;
+  layer.nvdb = makeNanoVDBGrid(
+      SPHERE, Eigen::Vector3d::Zero(), voxel, Eigen::Vector3i::Constant(-10), Eigen::Vector3i::Constant(10));
+  const SignedDistanceField sparse({ layer });
+  auto dense = makeGridField(SPHERE, 0.5, 21);
+
+  EXPECT_TRUE(sparse.isSparse());
+  EXPECT_FALSE(dense->isSparse());
+  EXPECT_TRUE(dense->getLayers().empty());
+  ASSERT_EQ(sparse.getLayers().size(), 1U);
+  EXPECT_TRUE(sparse.getDomain().min().isApprox(Eigen::Vector3d::Constant(-0.5), 1e-12));
+  EXPECT_TRUE(sparse.getDomain().max().isApprox(Eigen::Vector3d::Constant(0.5), 1e-12));
+  EXPECT_EQ(sparse.getDimensions(), Eigen::Vector3i::Constant(21));
+  EXPECT_ANY_THROW(sparse.getDistances());  // NOLINT
+
+  // Same samples (stored as float), same trilinear rule: the fields agree to float precision.
+  for (const Eigen::Vector3d& p : probePoints(0.49, voxel, 200))
+  {
+    EXPECT_NEAR(sparse.getDistance(p), dense->getDistance(p), 1e-6) << p.transpose();
+    EXPECT_TRUE(sparse.getGradient(p).isApprox(dense->getGradient(p), 1e-5)) << p.transpose();
+    EXPECT_TRUE(sparse.getGradient(p).isApprox(finiteDifferenceGradient(sparse, p, 1e-6), 1e-4)) << p.transpose();
+  }
+
+  // Outside the domain a single layer with no band clamp has no answer: +infinity, zero gradient.
+  EXPECT_EQ(sparse.getDistance(Eigen::Vector3d(0.6, 0, 0)), std::numeric_limits<double>::infinity());
+  EXPECT_TRUE(sparse.getGradient(Eigen::Vector3d(0.6, 0, 0)).isZero());
+
+  // A copy is equal; a clone (new UUID) and an independently built field hold identical content.
+  const SignedDistanceField copy = sparse;  // NOLINT(performance-unnecessary-copy-initialization)
+  EXPECT_TRUE(copy == sparse);
+  auto clone = std::static_pointer_cast<SignedDistanceField>(sparse.clone());
+  EXPECT_TRUE(clone->isSparse());
+  EXPECT_NE(clone->getUUID(), sparse.getUUID());
+  EXPECT_TRUE(tesseract::geometry::isIdentical(*clone, sparse));
+  EXPECT_EQ(clone->getDistance(Eigen::Vector3d(0.1, 0.2, 0.3)), sparse.getDistance(Eigen::Vector3d(0.1, 0.2, 0.3)));
+  EXPECT_TRUE(tesseract::geometry::isIdentical(SignedDistanceField({ layer }), sparse));
+  EXPECT_FALSE(
+      tesseract::geometry::isIdentical(SignedDistanceField({ layer }, Eigen::Vector3d::Constant(2.0)), sparse));
+  EXPECT_FALSE(tesseract::geometry::isIdentical(*dense, sparse));
+  EXPECT_FALSE(*dense == sparse);
+}
+
+TEST(TesseractGeometryUnit, SignedDistanceFieldSparseActivity)  // NOLINT
+{
+  using tesseract::geometry::SignedDistanceField;
+  using tesseract::geometry::SignedDistanceFieldLayer;
+  const double voxel = 0.05;
+  // A narrow band: only voxels within two voxels of the surface are active. The inactive voxels
+  // hold the background value 0, which would read as surface if it were blended in.
+  SignedDistanceFieldLayer band;
+  band.nvdb = makeNanoVDBGrid(SPHERE,
+                              Eigen::Vector3d::Zero(),
+                              voxel,
+                              Eigen::Vector3i::Constant(-10),
+                              Eigen::Vector3i::Constant(10),
+                              [voxel](const Eigen::Vector3d& p) { return std::abs(SPHERE(p)) <= 2.0 * voxel; });
+  const SignedDistanceField field({ band });
+
+  // Near the surface every surrounding voxel is active: a real read.
+  const Eigen::Vector3d on_band(0.31, 0.012, 0.007);
+  EXPECT_NEAR(field.getDistance(on_band), SPHERE(on_band), 5e-3);
+  // The centre is deep inside, where no voxel is active: no answer, not the background value 0.
+  EXPECT_EQ(field.getDistance(Eigen::Vector3d(0.01, 0.02, 0.03)), std::numeric_limits<double>::infinity());
+  // Where the eight voxels straddle the band edge, the read is refused too.
+  const Eigen::Vector3d edge(0.3 - (2.0 * voxel) - (0.5 * voxel), 0.0, 0.0);
+  EXPECT_EQ(field.getDistance(edge), std::numeric_limits<double>::infinity());
+
+  // With a band clamp on the (only, so last) layer, "no data" reads as that clamp.
+  band.band_clamp = 0.1;
+  const SignedDistanceField clamped({ band });
+  EXPECT_DOUBLE_EQ(clamped.getDistance(Eigen::Vector3d(0.01, 0.02, 0.03)), 0.1);
+  EXPECT_DOUBLE_EQ(clamped.getDistance(Eigen::Vector3d(5, 5, 5)), 0.1);
+  EXPECT_TRUE(clamped.getGradient(Eigen::Vector3d(5, 5, 5)).isZero());
+
+  // "No data" keeps the sign the grid stores there: with a negative inactive value (a level set's
+  // interior), the centre reads inside. Outside the domain it stays outside.
+  SignedDistanceFieldLayer signed_band;
+  signed_band.nvdb = makeNanoVDBGrid(
+      SPHERE,
+      Eigen::Vector3d::Zero(),
+      voxel,
+      Eigen::Vector3i::Constant(-10),
+      Eigen::Vector3i::Constant(10),
+      [voxel](const Eigen::Vector3d& p) { return std::abs(SPHERE(p)) <= 2.0 * voxel; },
+      -0.1F);
+  signed_band.band_clamp = 0.1;
+  const SignedDistanceField signed_field({ signed_band });
+  EXPECT_DOUBLE_EQ(signed_field.getDistance(Eigen::Vector3d(0.01, 0.02, 0.03)), -0.1);
+  EXPECT_TRUE(signed_field.getGradient(Eigen::Vector3d(0.01, 0.02, 0.03)).isZero());
+  EXPECT_DOUBLE_EQ(signed_field.getDistance(Eigen::Vector3d(5, 5, 5)), 0.1);
+  EXPECT_NEAR(signed_field.getDistance(on_band), SPHERE(on_band), 5e-3);
+}
+
+TEST(TesseractGeometryUnit, SignedDistanceFieldSparseEncoding)  // NOLINT
+{
+  using tesseract::geometry::SignedDistanceField;
+  using tesseract::geometry::SignedDistanceFieldLayer;
+  SignedDistanceFieldLayer fine;
+  fine.band_clamp = 0.05;
+  fine.nvdb = makeNanoVDBGrid([](const Eigen::Vector3d& p) { return std::clamp(SPHERE(p), -0.05, 0.05); },
+                              Eigen::Vector3d::Zero(),
+                              0.025,
+                              Eigen::Vector3i::Constant(-20),
+                              Eigen::Vector3i::Constant(20),
+                              [](const Eigen::Vector3d& p) { return std::abs(SPHERE(p)) <= 0.1; });
+  const SignedDistanceField field({ fine }, Eigen::Vector3d::Constant(1e-3));
+
+  // Layers are stored canonically: re-encoding a stored layer is a no-op.
+  const SignedDistanceField again(field.getLayers(), field.getScale());
+  EXPECT_EQ(again.getLayers(), field.getLayers());
+  EXPECT_TRUE(tesseract::geometry::isIdentical(again, field));
+
+  // NanoVDB round trip: the grid, read back with its clamp as the same sparse field.
+  const std::vector<std::uint8_t> nvdb = tesseract::geometry::writeSignedDistanceFieldNVDB(field);
+  auto read = tesseract::geometry::readSparseSignedDistanceFieldNVDB(nvdb, { 0.05 }, field.getScale());
+  ASSERT_TRUE(read->isSparse());
+  EXPECT_EQ(read->getLayers(), field.getLayers());
+  EXPECT_TRUE(tesseract::geometry::isIdentical(*read, field));
+  EXPECT_EQ(tesseract::geometry::writeSignedDistanceFieldNVDB(*read), nvdb);
+  for (const Eigen::Vector3d& p : probePoints(0.95, 0.025, 50))
+    EXPECT_EQ(read->getDistance(p), field.getDistance(p)) << p.transpose();
+  EXPECT_DOUBLE_EQ(read->getDistance(Eigen::Vector3d(5, 5, 5)), 0.05);
+  // The clamp travels beside the file, one per grid.
+  EXPECT_ANY_THROW(tesseract::geometry::readSparseSignedDistanceFieldNVDB(nvdb, { 0.05, 0.7 }));  // NOLINT
+
+  // A single grid reads back dense, whatever it is named.
+  auto dense = makeGridField(SPHERE, 0.5, 11);
+  EXPECT_FALSE(
+      tesseract::geometry::readSignedDistanceFieldNVDB(tesseract::geometry::writeSignedDistanceFieldNVDB(*dense))
+          ->isSparse());
+  const SignedDistanceField fine_only({ field.getLayers().front() });
+  auto fine_dense =
+      tesseract::geometry::readSignedDistanceFieldNVDB(tesseract::geometry::writeSignedDistanceFieldNVDB(fine_only));
+  EXPECT_FALSE(fine_dense->isSparse());
+  // The file records the layer's active bounds, so the dense read spans them and no more.
+  EXPECT_EQ(fine_dense->getDimensions(), fine_only.getDimensions());
+  // A dense field's NanoVDB file is also a valid one-layer sparse field over the same samples.
+  const SignedDistanceField from_dense({ { tesseract::geometry::writeSignedDistanceFieldNVDB(*dense), 0.0 } });
+  EXPECT_NEAR(from_dense.getDistance(Eigen::Vector3d(0.11, 0.23, -0.07)),
+              dense->getDistance(Eigen::Vector3d(0.11, 0.23, -0.07)),
+              1e-6);
+
+  // A sparse field is not one OpenVDB grid.
+  EXPECT_ANY_THROW(tesseract::geometry::writeSignedDistanceFieldVDB(field));  // NOLINT
+}
+
+TEST(TesseractGeometryUnit, SignedDistanceFieldSparseRejectsInvalidLayers)  // NOLINT
+{
+  using tesseract::geometry::SignedDistanceField;
+  using tesseract::geometry::SignedDistanceFieldLayer;
+  const std::vector<std::uint8_t> grid = makeNanoVDBGrid(
+      SPHERE, Eigen::Vector3d::Zero(), 0.1, Eigen::Vector3i::Constant(-3), Eigen::Vector3i::Constant(3));
+  EXPECT_ANY_THROW(SignedDistanceField(std::vector<SignedDistanceFieldLayer>{}));                 // NOLINT
+  EXPECT_ANY_THROW(SignedDistanceField({ SignedDistanceFieldLayer{} }));                          // NOLINT
+  EXPECT_ANY_THROW(SignedDistanceField({ { grid, 0.0 }, { grid, 0.0 } }));                        // NOLINT
+  EXPECT_ANY_THROW(SignedDistanceField({ { grid, -1.0 } }));                                      // NOLINT
+  EXPECT_ANY_THROW(SignedDistanceField({ { grid, std::numeric_limits<double>::quiet_NaN() } }));  // NOLINT
+  EXPECT_ANY_THROW(SignedDistanceField({ { std::vector<std::uint8_t>(64, 7), 0.0 } }));           // NOLINT
+  std::vector<std::uint8_t> truncated(grid.begin(), grid.begin() + static_cast<std::ptrdiff_t>(grid.size() / 2));
+  EXPECT_ANY_THROW(SignedDistanceField({ { truncated, 0.0 } }));  // NOLINT
+  EXPECT_NO_THROW(SignedDistanceField({ { grid, 0.0 } }));        // NOLINT
+
+  // The grid's own header: the last "NanoVDB" magic in the file starts the grid (the first is the
+  // file's). A fog volume (class 2 at offset 632) and an unknown major version (offset 16) are refused.
+  const std::string magic = "NanoVDB";
+  const auto grid_start = std::find_end(grid.begin(), grid.end(), magic.begin(), magic.end()) - grid.begin();
+  std::vector<std::uint8_t> fog = grid;
+  const std::uint32_t fog_class = 2;
+  std::memcpy(fog.data() + grid_start + 632, &fog_class, sizeof(fog_class));
+  EXPECT_ANY_THROW(SignedDistanceField({ { fog, 0.0 } }));  // NOLINT
+  std::vector<std::uint8_t> future = grid;
+  const std::uint32_t version = 33U << 21U;
+  std::memcpy(future.data() + grid_start + 16, &version, sizeof(version));
+  EXPECT_ANY_THROW(SignedDistanceField({ { future, 0.0 } }));  // NOLINT
+}
+
+TEST(TesseractGeometryUnit, SignedDistanceFieldInterpolation)  // NOLINT
+{
+  using tesseract::geometry::SignedDistanceField;
+  using tesseract::geometry::SignedDistanceFieldInterpolation;
+  using tesseract::geometry::SignedDistanceFieldLayer;
+  const std::array<SignedDistanceFieldInterpolation, 2> methods{ SignedDistanceFieldInterpolation::TRILINEAR,
+                                                                 SignedDistanceFieldInterpolation::TRICUBIC };
+
+  // Every method reproduces a linear field, value and gradient, away from the domain faces.
+  const tesseract::geometry::SignedDistanceFunction plane = [](const Eigen::Vector3d& p) {
+    return (0.3 * p.x()) - (0.5 * p.y()) + (0.8 * p.z()) + 0.1;
+  };
+  auto linear = makeGridField(plane, 0.5, 21);
+  for (auto method : methods)
+  {
+    linear->setInterpolation(method);
+    EXPECT_EQ(linear->getInterpolation(), method);
+    for (const Eigen::Vector3d& p : probePoints(0.35, 0.05, 30))
+    {
+      EXPECT_NEAR(linear->getDistance(p), plane(p), 1e-6) << static_cast<int>(method) << " " << p.transpose();
+      EXPECT_TRUE(linear->getGradient(p).isApprox(Eigen::Vector3d(0.3, -0.5, 0.8), 1e-5)) << static_cast<int>(method);
+    }
+  }
+
+  auto dense = makeGridField(SPHERE, 0.5, 21);
+  SignedDistanceFieldLayer layer;
+  layer.nvdb = makeNanoVDBGrid(
+      SPHERE, Eigen::Vector3d::Zero(), 0.05, Eigen::Vector3i::Constant(-10), Eigen::Vector3i::Constant(10));
+  SignedDistanceField sparse({ layer });
+  for (auto method : methods)
+  {
+    dense->setInterpolation(method);
+    sparse.setInterpolation(method);
+    for (const Eigen::Vector3d& p : probePoints(0.4, 0.05, 60))
+    {
+      // Sparse and dense agree under every method, and the gradient is the interpolant's own.
+      EXPECT_NEAR(sparse.getDistance(p), dense->getDistance(p), 1e-6) << static_cast<int>(method);
+      EXPECT_TRUE(sparse.getGradient(p).isApprox(dense->getGradient(p), 1e-5)) << static_cast<int>(method);
+      EXPECT_TRUE(dense->getGradient(p).isApprox(finiteDifferenceGradient(*dense, p, 1e-6), 1e-4))
+          << static_cast<int>(method) << " " << p.transpose();
+      // All are close to the true sphere distance at this resolution, away from the centre (where
+      // the true distance has a point the grid cannot hold).
+      if (p.norm() > 0.15)
+      {
+        EXPECT_NEAR(dense->getDistance(p), SPHERE(p), 5e-3) << static_cast<int>(method);
+      }
+    }
+  }
+
+  // Tricubic passes through the samples.
+  const Eigen::Vector3d node(0.15, -0.2, 0.25);  // a lattice point
+  dense->setInterpolation(SignedDistanceFieldInterpolation::TRICUBIC);
+  EXPECT_NEAR(dense->getDistance(node), static_cast<float>(SPHERE(node)), 1e-9);
+
+  // Across a cell face (x = 0.2) the trilinear gradient jumps; the tricubic gradient does not.
+  const Eigen::Vector3d below(0.2 - 1e-7, 0.13, 0.07);
+  const Eigen::Vector3d above(0.2 + 1e-7, 0.13, 0.07);
+  dense->setInterpolation(SignedDistanceFieldInterpolation::TRILINEAR);
+  EXPECT_GT((dense->getGradient(below) - dense->getGradient(above)).norm(), 1e-3);
+  dense->setInterpolation(SignedDistanceFieldInterpolation::TRICUBIC);
+  EXPECT_LT((dense->getGradient(below) - dense->getGradient(above)).norm(), 1e-5);
+
+  // Wider stencils need more active voxels: at the edge of a sparse grid's active region trilinear
+  // still answers where tricubic cannot.
+  const Eigen::Vector3d near_edge(0.47, 0.0, 0.0);  // between voxels 9 and 10, the last active one
+  sparse.setInterpolation(SignedDistanceFieldInterpolation::TRILINEAR);
+  EXPECT_TRUE(std::isfinite(sparse.getDistance(near_edge)));
+  sparse.setInterpolation(SignedDistanceFieldInterpolation::TRICUBIC);
+  EXPECT_EQ(sparse.getDistance(near_edge), std::numeric_limits<double>::infinity());
+
+  // The method is part of the field's identity, and clones keep it.
+  dense->setInterpolation(SignedDistanceFieldInterpolation::TRICUBIC);
+  auto clone = std::static_pointer_cast<SignedDistanceField>(dense->clone());
+  EXPECT_EQ(clone->getInterpolation(), SignedDistanceFieldInterpolation::TRICUBIC);
+  EXPECT_TRUE(tesseract::geometry::isIdentical(*clone, *dense));
+  clone->setInterpolation(SignedDistanceFieldInterpolation::TRILINEAR);
+  EXPECT_FALSE(tesseract::geometry::isIdentical(*clone, *dense));
+}
+
+TEST(TesseractGeometryUnit, SignedDistanceFieldSplitInterpolation)  // NOLINT
+{
+  using tesseract::geometry::SignedDistanceField;
+  using tesseract::geometry::SignedDistanceFieldInterpolation;
+  using tesseract::geometry::SignedDistanceFieldLayer;
+  constexpr auto LINEAR = SignedDistanceFieldInterpolation::TRILINEAR;
+  constexpr auto CUBIC = SignedDistanceFieldInterpolation::TRICUBIC;
+
+  auto linear = makeGridField(SPHERE, 0.5, 21);
+  auto cubic = makeGridField(SPHERE, 0.5, 21);
+  cubic->setInterpolation(CUBIC);
+  auto split = makeGridField(SPHERE, 0.5, 21);
+  split->setInterpolation(LINEAR);
+  split->setGradientInterpolation(CUBIC);
+  EXPECT_EQ(split->getInterpolation(), LINEAR);
+  EXPECT_EQ(split->getGradientInterpolation(), CUBIC);
+
+  SignedDistanceFieldLayer layer;
+  layer.nvdb = makeNanoVDBGrid(
+      SPHERE, Eigen::Vector3d::Zero(), 0.05, Eigen::Vector3i::Constant(-10), Eigen::Vector3i::Constant(10));
+  SignedDistanceField sparse_split({ layer });
+  sparse_split.setInterpolation(LINEAR);
+  sparse_split.setGradientInterpolation(CUBIC);
+
+  for (const Eigen::Vector3d& p : probePoints(0.4, 0.05, 40))
+  {
+    // Distance from the distance method, direction from the direction method.
+    EXPECT_DOUBLE_EQ(split->getDistance(p), linear->getDistance(p));
+    EXPECT_TRUE(split->getGradient(p).isApprox(cubic->getGradient(p), 1e-12));
+    // One call gives the same answers as two.
+    Eigen::Vector3d g;
+    EXPECT_DOUBLE_EQ(split->getDistanceAndGradient(p, g), split->getDistance(p));
+    EXPECT_TRUE(g.isApprox(split->getGradient(p), 1e-12));
+    // Sparse agrees with dense.
+    EXPECT_NEAR(sparse_split.getDistanceAndGradient(p, g), split->getDistance(p), 1e-6);
+    EXPECT_TRUE(g.isApprox(split->getGradient(p), 1e-5));
+  }
+
+  // Where the tricubic stencil reaches past the active voxels, the direction falls back to
+  // trilinear in the same layer rather than going blank or switching grid.
+  const Eigen::Vector3d near_edge(0.47, 0.01, 0.02);
+  SignedDistanceField sparse_linear({ layer });
+  Eigen::Vector3d g;
+  EXPECT_DOUBLE_EQ(sparse_split.getDistanceAndGradient(near_edge, g), sparse_linear.getDistance(near_edge));
+  EXPECT_TRUE(g.isApprox(sparse_linear.getGradient(near_edge), 1e-12));
+  EXPECT_GT(g.norm(), 0.5);
+
+  // setInterpolation sets both; the direction method is part of identity and survives clone.
+  auto clone = std::static_pointer_cast<SignedDistanceField>(split->clone());
+  EXPECT_EQ(clone->getGradientInterpolation(), CUBIC);
+  EXPECT_TRUE(tesseract::geometry::isIdentical(*clone, *split));
+  clone->setInterpolation(LINEAR);
+  EXPECT_EQ(clone->getGradientInterpolation(), LINEAR);
+  EXPECT_FALSE(tesseract::geometry::isIdentical(*clone, *split));
+  EXPECT_TRUE(tesseract::geometry::isIdentical(*clone, *linear));
 }
 
 TEST(TesseractGeometryUnit, Octree)  // NOLINT
