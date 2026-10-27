@@ -15,7 +15,7 @@
  * for example along the seam between two plates in welding.
  *
  * Usage: sdf_interpolation_benchmark [spacing_m] (default 0.001)
- *        sdf_interpolation_benchmark field.nvdb  (a real field, mm)
+ *        sdf_interpolation_benchmark whole.nvdb [cropped.nvdb [cropped_clamp_mm [blend_mm]]]  (real fields, mm)
  *
  * @copyright Copyright (c) 2026, Tesseract Robotics
  * @par License
@@ -364,16 +364,22 @@ std::vector<std::uint8_t> readFile(const std::string& path)
 }
 
 /**
- * @brief Benchmark a real fusion field (a millimetre NanoVDB file), read at scale 1e-3 (millimetres to metres).
+ * @brief Benchmark real fusion fields (millimetre NanoVDB files), read at scale 1e-3 (millimetres to metres).
  * @details No reference geometry exists for a real part, so this measures what can be measured:
- * load time and memory, dense-vs-sparse agreement (a fully active field, so both read the same
+ * load time and memory, dense-vs-sparse agreement on WHOLE (fully active, so both read the same
  * samples), query / hull / probe timings per method, and direction smoothness along the surface.
- * @param whole_path The field's .nvdb (read dense and sparse)
+ * @param whole_path WHOLE's .nvdb (read dense and sparse)
+ * @param cropped_path CROPPED's .nvdb, or empty (read sparse, layered over WHOLE)
  */
-int runRealFields(const std::string& whole_path)
+int runRealFields(const std::string& whole_path,
+                  const std::string& cropped_path,
+                  double CROPPED_CLAMP_MM,
+                  double blend_width_mm)
 {
   const Eigen::Vector3d scale = Eigen::Vector3d::Constant(1e-3);  // fields in mm, used in m
-  std::printf("# SDF benchmark on a real fusion field\n\nWHOLE: `%s`\n\nDistances in mm.\n\n", whole_path.c_str());
+  std::printf("# SDF benchmark on real fusion fields\n\nWHOLE: `%s`  \nCROPPED: `%s`\n\nDistances in mm.\n\n",
+              whole_path.c_str(),
+              cropped_path.empty() ? "(none)" : cropped_path.c_str());
 
   const std::vector<std::uint8_t> whole_bytes = readFile(whole_path);
   if (whole_bytes.empty())
@@ -391,6 +397,20 @@ int runRealFields(const std::string& whole_path)
   const double sparse_load = seconds(start);
   const double sparse_bytes = static_cast<double>(sparse->getLayers().front().nvdb.size());
 
+  std::shared_ptr<SignedDistanceField> layered;
+  double layered_load = 0;
+  if (!cropped_path.empty())
+  {
+    const std::vector<std::uint8_t> cropped_bytes = readFile(cropped_path);
+    if (cropped_bytes.empty())
+      throw std::runtime_error("cannot read " + cropped_path);
+    start = Clock::now();
+    layered = std::make_shared<SignedDistanceField>(
+        std::vector<SignedDistanceFieldLayer>{ { cropped_bytes, CROPPED_CLAMP_MM }, { whole_bytes, 0.0 } }, scale);
+    layered->setLayerBlendWidth(blend_width_mm);
+    layered_load = seconds(start);
+  }
+
   const Eigen::Vector3i dims = dense->getDimensions();
   std::printf("## Load and memory\n\n| Field | load (s) | memory (MB) | notes |\n| -- | --: | --: | -- |\n");
   std::printf("| WHOLE dense | %s | %s | %d x %d x %d samples as double |\n",
@@ -402,6 +422,17 @@ int runRealFields(const std::string& whole_path)
   std::printf("| WHOLE sparse | %s | %s | NanoVDB grid, read in place |\n",
               decimals(sparse_load, 2).c_str(),
               decimals(sparse_bytes / 1e6, 0).c_str());
+  if (layered)
+  {
+    double bytes = 0;
+    for (const auto& layer : layered->getLayers())
+      bytes += static_cast<double>(layer.nvdb.size());
+    std::printf("| CROPPED over WHOLE, sparse | %s | %s | two layers, clamp %.1f mm, blend %.1f mm |\n",
+                decimals(layered_load, 2).c_str(),
+                decimals(bytes / 1e6, 0).c_str(),
+                CROPPED_CLAMP_MM,
+                blend_width_mm);
+  }
 
   // Points near WHOLE's surface (metres, in the field's frame): true distance unknown, so read the
   // dense field, which is the same samples as the sparse one.
@@ -429,7 +460,17 @@ int runRealFields(const std::string& whole_path)
     return points;
   };
   const std::vector<Eigen::Vector3d> points = near_surface(*dense, scale, -0.002, 0.008, 200000, 7);
-  std::printf("\n%zu query points within [-2, +8] mm of WHOLE's surface.\n", points.size());
+  std::vector<Eigen::Vector3d> cropped_points;
+  if (layered)
+  {
+    // Points CROPPED itself answers (its band), so the layered rows time the fine layer.
+    const SignedDistanceField cropped_only(std::vector<SignedDistanceFieldLayer>{ layered->getLayers().front() },
+                                           scale);
+    cropped_points = near_surface(cropped_only, scale, -0.002, 0.003, 200000, 8);
+  }
+  std::printf("\n%zu query points within [-2, +8] mm of WHOLE's surface; %zu within [-2, +3] mm of CROPPED's.\n",
+              points.size(),
+              cropped_points.size());
 
   // Dense vs sparse WHOLE: same samples, two readers.
   double max_gap = 0;
@@ -526,7 +567,7 @@ int runRealFields(const std::string& whole_path)
             return g.squaredNorm() > 0;
           };
           std::size_t interpolation_jumps = 0;  // direction jumps, distance continuous
-          std::size_t data_jumps = 0;           // direction and distance jump: the edge of the data
+          std::size_t data_jumps = 0;           // direction and distance jump: layer handover or data edge
           std::size_t no_direction = 0;         // no data or a zero gradient
           std::size_t steps = 0;
           std::vector<double> smooth_turns;
@@ -607,6 +648,8 @@ int runRealFields(const std::string& whole_path)
       };
   run("WHOLE dense", *dense, points);
   run("WHOLE sparse", *sparse, points);
+  if (layered)
+    run("CROPPED over WHOLE (CROPPED's band)", *layered, cropped_points);
 
   std::printf("\n## Speed\n\n*Query* = one distance + normal at a point near the surface. *Hull* = one vertex-query "
               "check of a 1477-vertex, 10 mm hull whose nearest vertex is 3 mm off the surface, the normal read only "
@@ -618,7 +661,7 @@ int runRealFields(const std::string& whole_path)
               "along it in 1/64 mm steps. Any step turning more than 0.5 deg is bisected to ~0.1 nm: a turn that "
               "survives is a discontinuity. *Interpolation jumps* = the direction jumps while the distance stays "
               "continuous (a trilinear cell-face jump, or a stencil switching method). *Data jumps* = the distance "
-              "jumps too (the edge of the grid's data). *No direction* = no data or a zero "
+              "jumps too (a layer handover or the edge of a layer's data). *No direction* = no data or a zero "
               "gradient on either side. Turn percentiles are over the steps with no discontinuity (deg per 1/64 "
               "mm). *Jump size* = the direction change across an interpolation jump, median / p99.\n\n| Field | Method "
               "| "
@@ -634,7 +677,10 @@ int main(int argc, char** argv)
 {
   const std::string first = (argc > 1) ? argv[1] : "";
   if (first.size() > 5 && first.compare(first.size() - 5, 5, ".nvdb") == 0)
-    return runRealFields(first);
+    // CROPPED's band clamp in mm (band width in voxels x voxel size): a layer answers only under its clamp.
+    // Then the width over which CROPPED fades into WHOLE below that clamp, in mm (0: no blend).
+    return runRealFields(
+        first, (argc > 2) ? argv[2] : "", (argc > 3) ? std::atof(argv[3]) : 3.2, (argc > 4) ? std::atof(argv[4]) : 0.0);
   const double spacing = (argc > 1) ? std::atof(argv[1]) : 0.001;
   const std::vector<Shape> shapes = makeShapes(spacing);
   const int n = static_cast<int>(std::lround(2 * EXTENT / spacing)) + 1;

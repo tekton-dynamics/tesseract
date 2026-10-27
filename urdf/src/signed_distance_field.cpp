@@ -95,8 +95,8 @@ parseSignedDistanceField(const tinyxml2::XMLElement* xml_element, const tesserac
     scale = Eigen::Vector3d(sx, sy, sz);
   }
 
-  // A sparse field's band clamp, one per grid of an .nvdb file. Without it the file is read as one
-  // dense grid.
+  // A sparse field's layers' band clamps, finest first, one per grid of an .nvdb file. Without them
+  // the file is read as one dense grid.
   std::string clamps_string;
   std::vector<double> band_clamps;
   if (tesseract::common::QueryStringAttribute(xml_element, "band_clamps", clamps_string) == tinyxml2::XML_SUCCESS)

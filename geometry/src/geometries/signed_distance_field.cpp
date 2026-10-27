@@ -52,6 +52,9 @@ namespace tesseract::geometry
 {
 namespace
 {
+/// A read within this fraction of a layer's band clamp counts as saturated: float-error sized, so
+/// genuine interpolants just inside the clamp keep their meaning.
+constexpr double SATURATION_RELATIVE_TOLERANCE = 1e-4;
 /// Largest |index| a query may reach before it is treated as outside every grid (keeps int casts safe).
 constexpr double MAX_INDEX_MAGNITUDE = 1e9;
 
@@ -229,8 +232,8 @@ public:
 
   explicit SignedDistanceFieldSparseGrids(std::vector<SignedDistanceFieldLayer> layers) : layers_(std::move(layers))
   {
-    if (layers_.size() != 1)
-      throw std::runtime_error("SignedDistanceField: a sparse field takes exactly one layer");
+    if (layers_.empty())
+      throw std::runtime_error("SignedDistanceField: a sparse field needs at least one layer");
 
     grids_.reserve(layers_.size());
     domain_.setEmpty();
@@ -239,6 +242,9 @@ public:
     {
       grids_.push_back(parse(layers_[i], i));
       const Grid& grid = grids_.back();
+      if (i > 0 && grid.voxel_size < grids_[i - 1].voxel_size)
+        throw std::runtime_error("SignedDistanceField: layer " + std::to_string(i) +
+                                 " is finer than the layer before it; order the layers finest first");
       domain_.extend(grid.origin + (grid.active_min.cast<double>() * grid.voxel_size));
       domain_.extend(grid.origin + (grid.active_max.cast<double>() * grid.voxel_size));
       finest_voxel_size_ = std::min(finest_voxel_size_, grid.voxel_size);
@@ -254,16 +260,20 @@ public:
   /**
    * @brief The field's distance at @p point (local frame), read with @p distance_method, and its
    * gradient when @p gradient is set, read with @p gradient_method.
-   * @details Where @p gradient_method cannot read (a wider stencil reaching past the active voxels),
-   * the direction falls back to @p distance_method there.
+   * @details The layer is chosen by the distance read alone, so distance and direction always come
+   * from the same grid. Where @p gradient_method cannot read in that layer (a wider stencil reaching
+   * past its active voxels), the direction falls back to @p distance_method there. With
+   * @p blend_width > 0, a read within that width of its layer's clamp fades into the next layer's
+   * answer (see @ref SignedDistanceField::setLayerBlendWidth).
    */
   double query(const Eigen::Vector3d& point,
                Eigen::Vector3d* gradient,
                SignedDistanceFieldInterpolation distance_method,
-               SignedDistanceFieldInterpolation gradient_method) const
+               SignedDistanceFieldInterpolation gradient_method,
+               double blend_width) const
   {
     double distance{ 0 };
-    if (domain_.contains(point) && answer(point, gradient, distance_method, gradient_method, distance))
+    if (domain_.contains(point) && answer(0, point, gradient, distance_method, gradient_method, blend_width, distance))
       return distance;
 
     if (gradient != nullptr)
@@ -559,24 +569,69 @@ private:
     return true;
   }
 
-  /** @brief The grid's answer at @p point (see @ref query); false where it has no data. */
-  bool answer(const Eigen::Vector3d& point,
+  /**
+   * @brief The answer of the first layer from @p first on that has one (see @ref query); false if none does.
+   * @details In the blend zone, the last @p blend_width (capped at the clamp) below a layer's clamp,
+   * the answer is (1 - s) * this layer + s * the next layers' answer, with s a smoothstep of the
+   * position across the zone, so the distance is continuous across the handover and so is its
+   * gradient where both layers' are. Where the next layers have no answer the zone keeps this layer's.
+   */
+  bool answer(std::size_t first,
+              const Eigen::Vector3d& point,
               Eigen::Vector3d* gradient,
               SignedDistanceFieldInterpolation distance_method,
               SignedDistanceFieldInterpolation gradient_method,
+              double blend_width,
               double& distance) const
   {
-    const Grid& grid = grids_.front();
     const bool same_method = (distance_method == gradient_method);
-    if (!sample(grid, point, distance_method, distance, same_method ? gradient : nullptr))
-      return false;
-    if (gradient != nullptr && !same_method)
+    for (std::size_t i = first; i < grids_.size(); ++i)
     {
-      double unused{ 0 };
-      if (!sample(grid, point, gradient_method, unused, gradient))
-        sample(grid, point, distance_method, unused, gradient);
+      if (!sample(grids_[i], point, distance_method, distance, same_method ? gradient : nullptr))
+        continue;
+
+      // Every layer but the last defers a saturated read to the next one: at its clamp a narrow
+      // band says only "at least this far", while a coarser layer has the real distance.
+      const bool last = (i + 1 == grids_.size());
+      const double clamp = grids_[i].band_clamp;
+      const double reach = std::abs(distance);
+      if (!last && clamp > 0.0 && reach >= clamp * (1.0 - SATURATION_RELATIVE_TOLERANCE))
+        continue;
+
+      if (gradient != nullptr && !same_method)
+      {
+        double unused{ 0 };
+        if (!sample(grids_[i], point, gradient_method, unused, gradient))
+          sample(grids_[i], point, distance_method, unused, gradient);
+      }
+
+      const double zone_start = clamp - std::min(blend_width, clamp);
+      if (last || clamp <= 0.0 || blend_width <= 0.0 || reach <= zone_start)
+        return true;
+      Eigen::Vector3d next_gradient = Eigen::Vector3d::Zero();
+      double next{ 0 };
+      if (!answer(i + 1,
+                  point,
+                  gradient != nullptr ? &next_gradient : nullptr,
+                  distance_method,
+                  gradient_method,
+                  blend_width,
+                  next))
+        return true;
+      const double width = clamp - zone_start;
+      const double t = std::min((reach - zone_start) / width, 1.0);
+      const double s = t * t * (3.0 - (2.0 * t));
+      if (gradient != nullptr)
+      {
+        // d/dx of (1 - s) d + s n, with s a function of |d|.
+        const double ds = 6.0 * t * (1.0 - t) / width;
+        const double sign = (distance < 0.0) ? -1.0 : 1.0;
+        *gradient = ((1.0 - s) * *gradient) + (s * next_gradient) + ((next - distance) * ds * sign * *gradient);
+      }
+      distance = ((1.0 - s) * distance) + (s * next);
+      return true;
     }
-    return true;
+    return false;
   }
 
   /** @brief The value @p grid stores at the voxel nearest @p point, active or not (a tile's or the background). */
@@ -750,7 +805,7 @@ void SignedDistanceField::discretize() const
 double SignedDistanceField::getDistance(const Eigen::Vector3d& point) const
 {
   if (sparse_ != nullptr)
-    return sparse_->query(point, nullptr, interpolation_, gradient_interpolation_);
+    return sparse_->query(point, nullptr, interpolation_, gradient_interpolation_, layer_blend_width_);
 
   // A function-backed field evaluates its sampler directly (exact, no resampling).
   if (sampler_ != nullptr)
@@ -770,7 +825,7 @@ Eigen::Vector3d SignedDistanceField::getGradient(const Eigen::Vector3d& point) c
   Eigen::Vector3d gradient = Eigen::Vector3d::Zero();
   if (sparse_ != nullptr)
   {
-    sparse_->query(point, &gradient, interpolation_, gradient_interpolation_);
+    sparse_->query(point, &gradient, interpolation_, gradient_interpolation_, layer_blend_width_);
     return gradient;
   }
 
@@ -806,7 +861,7 @@ Eigen::Vector3d SignedDistanceField::getGradient(const Eigen::Vector3d& point) c
 double SignedDistanceField::getDistanceAndGradient(const Eigen::Vector3d& point, Eigen::Vector3d& gradient) const
 {
   if (sparse_ != nullptr)
-    return sparse_->query(point, &gradient, interpolation_, gradient_interpolation_);
+    return sparse_->query(point, &gradient, interpolation_, gradient_interpolation_, layer_blend_width_);
   if (sampler_ != nullptr)
   {
     gradient = getGradient(point);
@@ -871,6 +926,15 @@ void SignedDistanceField::setGradientInterpolation(SignedDistanceFieldInterpolat
   gradient_interpolation_ = interpolation;
 }
 
+void SignedDistanceField::setLayerBlendWidth(double width)
+{
+  if (!std::isfinite(width) || width < 0.0)
+    throw std::invalid_argument("SignedDistanceField: the layer blend width must be finite and non-negative");
+  layer_blend_width_ = width;
+}
+
+double SignedDistanceField::getLayerBlendWidth() const { return layer_blend_width_; }
+
 SignedDistanceFieldInterpolation SignedDistanceField::getGradientInterpolation() const
 {
   return gradient_interpolation_;
@@ -895,14 +959,14 @@ Geometry::Ptr SignedDistanceField::clone() const
 
 bool SignedDistanceField::operator==(const SignedDistanceField& rhs) const
 {
-  // Sparse fields are equal when their layers are: same grid, same clamp.
+  // Sparse fields are equal when their layers are: same grids, same clamps, same order.
   if (sparse_ != nullptr || rhs.sparse_ != nullptr)
   {
     if (sparse_ == nullptr || rhs.sparse_ == nullptr)
       return false;
     return Geometry::operator==(rhs) && sparse_->layers() == rhs.sparse_->layers() &&
            scale_.isApprox(rhs.scale_, 1e-5) && interpolation_ == rhs.interpolation_ &&
-           gradient_interpolation_ == rhs.gradient_interpolation_;
+           gradient_interpolation_ == rhs.gradient_interpolation_ && layer_blend_width_ == rhs.layer_blend_width_;
   }
 
   // Equality is defined on the materialized grids (samplers cannot be compared).

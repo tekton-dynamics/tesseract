@@ -8,6 +8,7 @@
 #include <octomap/octomap.h>
 
 #include <cereal/cereal.hpp>
+#include <cmath>
 #include <cereal/types/memory.hpp>
 #include <cereal/types/vector.hpp>
 #include <cereal/types/polymorphic.hpp>
@@ -122,7 +123,7 @@ void serialize(Archive& ar, Octree& obj)
 }
 
 /** @brief The archive format version @ref serialize writes for a SignedDistanceField. */
-constexpr std::uint32_t SIGNED_DISTANCE_FIELD_ARCHIVE_VERSION = 1;
+constexpr std::uint32_t SIGNED_DISTANCE_FIELD_ARCHIVE_VERSION = 2;
 
 template <class Archive>
 void serialize(Archive& ar, SignedDistanceFieldLayer& obj)
@@ -132,9 +133,10 @@ void serialize(Archive& ar, SignedDistanceFieldLayer& obj)
 }
 
 /**
- * @brief Format version 1, the first with a version: the interpolation settings, then either the
- * layers (a sparse field, whose domain and dimensions follow from them) or the dense grid, then the
- * scale. A later format bumps SIGNED_DISTANCE_FIELD_ARCHIVE_VERSION and branches on it here.
+ * @brief Format version 2: the interpolation settings and layer blend width, then either the layers (a
+ * sparse field, whose domain and dimensions follow from them) or the dense grid, then the scale.
+ * Version 1 had no blend width; its archives load with a width of 0. A later format bumps
+ * SIGNED_DISTANCE_FIELD_ARCHIVE_VERSION and branches on it here.
  * @note An explicit field rather than CEREAL_CLASS_VERSION: cereal also matches the base class's
  * unversioned serialize for this type and rejects the pair as ambiguous.
  */
@@ -147,12 +149,16 @@ void serialize(Archive& ar, SignedDistanceField& obj)
   ar(cereal::base_class<Geometry>(&obj));
   std::uint32_t version = SIGNED_DISTANCE_FIELD_ARCHIVE_VERSION;
   ar(cereal::make_nvp("version", version));
-  if (version != SIGNED_DISTANCE_FIELD_ARCHIVE_VERSION)
+  if (version < 1 || version > SIGNED_DISTANCE_FIELD_ARCHIVE_VERSION)
     throw std::runtime_error("SignedDistanceField: unsupported archive version " + std::to_string(version));
   auto interpolation = static_cast<std::uint8_t>(obj.interpolation_);
   auto gradient_interpolation = static_cast<std::uint8_t>(obj.gradient_interpolation_);
   ar(cereal::make_nvp("interpolation", interpolation));
   ar(cereal::make_nvp("gradient_interpolation", gradient_interpolation));
+  if (version >= 2)
+    ar(cereal::make_nvp("layer_blend_width", obj.layer_blend_width_));
+  else
+    obj.layer_blend_width_ = 0.0;
   if (Archive::is_loading::value)
   {
     for (std::uint8_t method : { interpolation, gradient_interpolation })
@@ -160,6 +166,8 @@ void serialize(Archive& ar, SignedDistanceField& obj)
         throw std::runtime_error("SignedDistanceField: unknown interpolation " + std::to_string(method));
     obj.interpolation_ = static_cast<SignedDistanceFieldInterpolation>(interpolation);
     obj.gradient_interpolation_ = static_cast<SignedDistanceFieldInterpolation>(gradient_interpolation);
+    if (!std::isfinite(obj.layer_blend_width_) || obj.layer_blend_width_ < 0.0)
+      throw std::runtime_error("SignedDistanceField: the layer blend width must be finite and non-negative");
   }
   std::vector<SignedDistanceFieldLayer> layers = obj.getLayers();
   ar(cereal::make_nvp("layers", layers));

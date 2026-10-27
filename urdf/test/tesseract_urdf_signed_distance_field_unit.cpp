@@ -23,7 +23,7 @@ std::vector<std::uint8_t> makeTestSignedDistanceFieldVDB()
   return tesseract::geometry::writeSignedDistanceFieldVDB(*sdf);
 }
 
-/** @brief A sparse field's NanoVDB file: one grid, the band clamp not stored in it. */
+/** @brief A two-layer sparse field's NanoVDB file: two grids, the band clamps not stored in it. */
 std::vector<std::uint8_t> makeTestSparseSignedDistanceFieldNVDB()
 {
   const tesseract::geometry::SignedDistanceFunction sphere = [](const Eigen::Vector3d& point) {
@@ -31,8 +31,11 @@ std::vector<std::uint8_t> makeTestSparseSignedDistanceFieldNVDB()
   };
   const auto fine = tesseract::geometry::createDiscreteSignedDistanceField(
       sphere, Eigen::Vector3d(-0.75, -0.75, -0.75), Eigen::Vector3d(0.75, 0.75, 0.75), Eigen::Vector3i(7, 7, 7));
+  const auto coarse = tesseract::geometry::createDiscreteSignedDistanceField(
+      sphere, Eigen::Vector3d(-1, -1, -1), Eigen::Vector3d(1, 1, 1), Eigen::Vector3i(5, 5, 5));
   const tesseract::geometry::SignedDistanceField sparse(
-      { { tesseract::geometry::writeSignedDistanceFieldNVDB(*fine), 0.25 } });
+      { { tesseract::geometry::writeSignedDistanceFieldNVDB(*fine), 0.25 },
+        { tesseract::geometry::writeSignedDistanceFieldNVDB(*coarse), 0.0 } });
   return tesseract::geometry::writeSignedDistanceFieldNVDB(sparse);
 }
 
@@ -93,8 +96,8 @@ TEST(TesseractURDFUnit, parse_signed_distance_field)  // NOLINT
     EXPECT_NEAR(geom->getScale()[2], 3, 1e-5);
   }
 
-  {  // Band clamps: an .nvdb file's grid read as a sparse field
-    std::string str = R"(<tesseract:signed_distance_field filename="memory://layers.nvdb" band_clamps="0.25"/>)";
+  {  // Band clamps: an .nvdb file's grids read as the layers of a sparse field
+    std::string str = R"(<tesseract:signed_distance_field filename="memory://layers.nvdb" band_clamps="0.25 0"/>)";
     tesseract::geometry::SignedDistanceField::Ptr geom;
     EXPECT_TRUE(runTest<tesseract::geometry::SignedDistanceField::Ptr>(
         geom,
@@ -104,12 +107,23 @@ TEST(TesseractURDFUnit, parse_signed_distance_field)  // NOLINT
         resource_locator));
     ASSERT_TRUE(geom != nullptr);
     ASSERT_TRUE(geom->isSparse());
-    ASSERT_EQ(geom->getLayers().size(), 1);
+    ASSERT_EQ(geom->getLayers().size(), 2);
     EXPECT_DOUBLE_EQ(geom->getLayers()[0].band_clamp, 0.25);
   }
 
-  {  // Failure: two clamps for a one-grid file
-    std::string str = R"(<tesseract:signed_distance_field filename="memory://layers.nvdb" band_clamps="0.25 0"/>)";
+  {  // Failure: one clamp for a two-grid file
+    std::string str = R"(<tesseract:signed_distance_field filename="memory://layers.nvdb" band_clamps="0.25"/>)";
+    tesseract::geometry::SignedDistanceField::Ptr geom;
+    EXPECT_FALSE(runTest<tesseract::geometry::SignedDistanceField::Ptr>(
+        geom,
+        &tesseract::urdf::parseSignedDistanceField,
+        str,
+        tesseract::urdf::SIGNED_DISTANCE_FIELD_ELEMENT_NAME.data(),
+        resource_locator));
+  }
+
+  {  // Failure: a two-grid file without clamps is not one dense grid
+    std::string str = R"(<tesseract:signed_distance_field filename="memory://layers.nvdb"/>)";
     tesseract::geometry::SignedDistanceField::Ptr geom;
     EXPECT_FALSE(runTest<tesseract::geometry::SignedDistanceField::Ptr>(
         geom,
